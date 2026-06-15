@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tablero Capacidad & Estrategia de Proceso</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jstat/1.9.6/jstat.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        /* Se cambió el color de fondo a Teal #008080 */
+        body { font-family: 'Inter', sans-serif; background-color: #008080; color: #0f172a; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .glass-panel { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); border: 1px solid #e2e8f0; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // --- FUNCIONES MATEMÁTICAS Y ESTADÍSTICAS ---
+        const calcStats = (arr) => {
+            if (!arr || arr.length === 0) return { mean: 0, var: 0, std: 0, n: 0 };
+            const n = arr.length;
+            const mean = arr.reduce((a, b) => a + b, 0) / n;
+            const variance = n > 1 ? arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (n - 1) : 0;
+            return { mean, var: variance, std: Math.sqrt(variance), n };
+        };
+
+        const calcPpk = (mean, std, usl, lsl, isUnilateral) => {
+            if (std === 0 || isNaN(std) || isNaN(mean)) return 0;
+            if (isUnilateral) return (usl - mean) / (3 * std);
+            return Math.min(usl - mean, mean - lsl) / (3 * std);
+        };
+
+        const bartlettTest = (groups) => {
+            const validGroups = groups.filter(g => g && g.length > 1);
+            const k = validGroups.length;
+            if (k < 2) return 1;
+
+            const statsList = validGroups.map(g => calcStats(g));
+            const nonZeroVarStats = statsList.filter(s => s.var > 1e-10); 
+            if (nonZeroVarStats.length === 0) return 1; 
+            if (nonZeroVarStats.length < k) return 0;   
+
+            let N = 0, sum_num = 0, sum_den_1 = 0, sum_inv_df = 0;
+
+            for (let i = 0; i < k; i++) {
+                const stats = statsList[i];
+                const df = stats.n - 1;
+                N += stats.n;
+                sum_num += df * stats.var;
+                sum_den_1 += df * Math.log(stats.var);
+                sum_inv_df += 1 / df;
+            }
+
+            if (N - k <= 0) return 1;
+
+            const Sp2 = sum_num / (N - k);
+            const T = (N - k) * Math.log(Sp2) - sum_den_1;
+            const C = 1 + (1 / (3 * (k - 1))) * (sum_inv_df - (1 / (N - k)));
+            const chiSquareStat = T / C;
+            
+            const pValue = 1 - jStat.chisquare.cdf(chiSquareStat, k - 1);
+            return isNaN(pValue) ? 1 : Math.max(0, pValue);
+        };
+
+        const extractGroupName = (colName) => colName.trim();
+
+        const getTargetPpk = (categoria) => {
+            const cat = (categoria || "").toLowerCase();
+            if (cat.includes("ctq")) return 1.33;
+            if (cat.includes("dva") || cat.includes("apariencia")) return 1.0;
+            return 0.8; // Default para CP
+        };
+
+        // --- PROCESAMIENTO DEL CSV DINÁMICO ---
+        const processData = (parsedData, excludedMolds = []) => {
+            let headerIdx = -1;
+            for (let i = 0; i < Math.min(20, parsedData.length); i++) {
+                const row = parsedData[i];
+                if (row.some(c => c && typeof c === 'string' && (
+                    c.trim().toLowerCase() === 'dimension' || 
+                    c.trim().toLowerCase() === 'dimensión' || 
+                    c.trim().toLowerCase() === 'nombre del objeto'
+                ))) {
+                    headerIdx = i;
+                    break;
+                }
+            }
+            if (headerIdx === -1) throw new Error("No se encontró la fila de encabezados con 'Dimension' o 'Nombre del objeto'.");
+
+            let extractedPartInfo = "";
+            for (let i = 0; i < headerIdx; i++) {
+                const textCells = parsedData[i].filter(c => c && typeof c === 'string' && c.trim().length > 0);
+                if (textCells.length > 0) {
+                    extractedPartInfo = textCells.join(" | ");
+                    break;
+                }
+            }
+
+            const headers = parsedData[headerIdx].map(h => h ? h.trim() : '');
+            const rawRows = parsedData.slice(headerIdx + 1).filter(r => r[0]);
+
+            const colIdx = {
+                dimension: headers.findIndex(h => h.toLowerCase() === 'dimension' || h.toLowerCase() === 'dimensión' || h.toLowerCase() === 'nombre del objeto'),
+                categoria: headers.findIndex(h => h.toLowerCase().includes('categoria') || h.toLowerCase().includes('zona')),
+                espec: headers.findIndex(h => h.toLowerCase().includes('espec.') || h.toLowerCase() === 'espec'),
+                tolSup: headers.findIndex(h => h.toLowerCase().includes('tol. sup') || (h.toLowerCase().includes('tol') && h.toLowerCase().includes('sup'))),
+                tolInf: headers.findIndex(h => h.toLowerCase().includes('tol. inf') || (h.toLowerCase().includes('tol') && h.toLowerCase().includes('inf')))
+            };
+
+            const measurementCols = [];
+            headers.forEach((h, i) => {
+                if (i > Math.max(...Object.values(colIdx)) && h !== "") {
+                    measurementCols.push({ index: i, name: h, group: extractGroupName(h) });
+                }
+            });
+
+            // Listado de todos los moldes detectados vs los activos
+            const allAvailableMolds = Array.from(new Set(measurementCols.map(c => c.group)));
+            const activeCols = measurementCols.filter(c => !excludedMolds.includes(c.group));
+            const activeMoldNames = Array.from(new Set(activeCols.map(c => c.group)));
+
+            const processedRows = rawRows.map((row, rowId) => {
+                const dimension = row[colIdx.dimension];
+                
+                let categoria = colIdx.categoria >= 0 ? row[colIdx.categoria].trim() : "CP";
+                if (!categoria) categoria = "CP";
+
+                const espec = parseFloat(row[colIdx.espec]) || 0;
+                let tSup = parseFloat(row[colIdx.tolSup]) || 0;
+                let tInf = parseFloat(row[colIdx.tolInf]) || 0;
+                
+                let rawLsl = espec + tInf;
+                if (tInf > 0 && !row[colIdx.tolInf].toString().trim().startsWith('-')) {
+                    rawLsl = espec - tInf;
+                }
+                
+                const calcUsl = espec + tSup;
+                const usl = Math.max(calcUsl, rawLsl);
+                const lsl = Math.min(calcUsl, rawLsl);
+
+                const isUnilateral = (tInf === 0 && lsl === espec);
+                const targetPpk = getTargetPpk(categoria);
+
+                const groups = {};
+                let allValues = [];
+                
+                // Mapeo solo para las columnas de los moldes que están ACTIVOS
+                activeCols.forEach(mCol => {
+                    const val = parseFloat(row[mCol.index]);
+                    if (!isNaN(val)) { 
+                        if (!groups[mCol.group]) groups[mCol.group] = [];
+                        groups[mCol.group].push(val);
+                        allValues.push(val);
+                    }
+                });
+
+                const globalStats = calcStats(allValues);
+                const globalPpk = calcPpk(globalStats.mean, globalStats.std, usl, lsl, isUnilateral);
+                const actRango = usl - lsl;
+                const idr = Math.abs(actRango) > 0 ? (Math.abs(globalStats.mean - espec) / Math.abs(actRango)) * 100 : 0;
+
+                const moldesData = activeMoldNames.map(gName => {
+                    const groupArr = groups[gName] || [];
+                    
+                    let restArr = [];
+                    activeMoldNames.forEach(otherName => {
+                        if (otherName !== gName && groups[otherName]) {
+                            restArr = restArr.concat(groups[otherName]);
+                        }
+                    });
+
+                    const gStats = calcStats(groupArr);
+                    const pValue = bartlettTest([groupArr, restArr]);
+                    const isStable = pValue >= 0.05;
+                    const ppk = calcPpk(gStats.mean, gStats.std, usl, lsl, isUnilateral);
+                    const moldIdr = Math.abs(actRango) > 0 ? (Math.abs(gStats.mean - espec) / Math.abs(actRango)) * 100 : 0;
+
+                    return { name: gName, values: groupArr, stats: gStats, pValue, isStable, ppk, idr: moldIdr };
+                });
+
+                const stableMolds = moldesData.filter(m => m.isStable);
+                let pooledSigma = globalStats.std;
+                if (stableMolds.length > 0) {
+                    let sumNum = 0, sumDen = 0;
+                    stableMolds.forEach(m => {
+                        sumNum += (m.stats.n - 1) * m.stats.var;
+                        sumDen += (m.stats.n - 1);
+                    });
+                    pooledSigma = sumDen > 0 ? Math.sqrt(sumNum / sumDen) : globalStats.std;
+                }
+
+                const isGDTUnilateral = dimension.toUpperCase().includes('GD&T') && isUnilateral;
+                let propUsl, propLsl;
+                
+                if (isGDTUnilateral) {
+                    propLsl = espec; 
+                    propUsl = espec + (6 * pooledSigma); 
+                } else {
+                    propUsl = espec + (3 * pooledSigma);
+                    propLsl = espec - (3 * pooledSigma);
+                }
+                const propRango = propUsl - propLsl;
+
+                const projPpk = calcPpk(globalStats.mean, pooledSigma, usl, lsl, isUnilateral);
+                
+                let redefStrategy = "Mantener";
+                if (projPpk >= targetPpk && globalPpk < targetPpk) redefStrategy = "Centrar Proceso";
+                else if (projPpk < targetPpk) redefStrategy = "Redefinir Tolerancia";
+                else if (globalPpk >= targetPpk) redefStrategy = "Consolidar";
+
+                return {
+                    id: rowId, dimension, categoria, targetPpk, espec, usl, lsl, actRango, isUnilateral, isGDTUnilateral,
+                    globalStats, globalPpk, idr, moldesData,
+                    pooledSigma, propUsl, propLsl, propRango, projPpk, redefStrategy
+                };
+            });
+
+            return { rawData: processedRows, partInfo: extractedPartInfo, allAvailableMolds };
+        };
+
+        // --- COMPONENTES UI ---
+        const CardKPI = ({ title, value, sub, colorClass="text-teal-600" }) => (
+            <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">{title}</h3>
+                <div className={`text-2xl font-black ${colorClass}`}>{value}</div>
+                {sub && <div className="text-xs text-slate-400 mt-1 font-medium">{sub}</div>}
+            </div>
+        );
+
+        const ResumenView = ({ data }) => {
+            const plotDivHist = useRef(null);
+
+            useEffect(() => {
+                if(!data || data.length === 0 || !plotDivHist.current) return;
+
+                const propRangos = data.map(d => d.propRango);
+                let minR = Math.min(...propRangos);
+                let maxR = Math.max(...propRangos);
+                
+                if(minR === maxR) { maxR += 0.01; minR -= 0.01; }
+                
+                const binSize = (maxR - minR) / 8;
+                const bins = Array.from({length: 8}, () => []);
+                
+                data.forEach(d => {
+                    let binIdx = Math.floor((d.propRango - minR) / binSize);
+                    if(binIdx >= 8) binIdx = 7;
+                    if(binIdx < 0) binIdx = 0;
+                    bins[binIdx].push(d);
+                });
+
+                const barX = [];
+                const barY = [];
+                const scatterX = [];
+                const scatterY = [];
+                const scatterText = [];
+
+                bins.forEach((bin, i) => {
+                    const rangeStart = minR + i * binSize;
+                    const rangeEnd = minR + (i + 1) * binSize;
+                    const binLabel = `${rangeStart.toFixed(3)} - ${rangeEnd.toFixed(3)}`;
+                    
+                    barX.push(binLabel);
+                    barY.push(bin.length);
+
+                    bin.forEach((d, j) => {
+                        scatterX.push(binLabel);
+                        scatterY.push(j + 0.5); 
+                        
+                        const tolStr = d.isGDTUnilateral 
+                            ? `+${d.propRango.toFixed(3)} / -0.000` 
+                            : `+/- ${(d.propRango/2).toFixed(3)}`;
+                        
+                        scatterText.push(`<b>${d.dimension}</b><br>Rango Total: ${d.propRango.toFixed(3)}<br>Límites Sugeridos: ${tolStr}<br>Categoría: ${d.categoria}`);
+                    });
+                });
+
+                const traceBar = {
+                    x: barX, y: barY,
+                    type: 'bar', name: 'Cantidad',
+                    text: barY.map(v => v > 0 ? v : ''),
+                    textposition: 'outside',
+                    textfont: { color: '#006666', size: 13, family: 'Inter' },
+                    marker: { color: 'rgba(0, 128, 128, 0.15)', line: { color: 'rgba(0, 128, 128, 0.5)', width: 1 } },
+                    hoverinfo: 'none'
+                };
+
+                const traceScatter = {
+                    x: scatterX, y: scatterY, text: scatterText,
+                    mode: 'markers', type: 'scatter', name: 'Dimensiones',
+                    marker: { color: '#008080', size: 9, line: { color: '#ffffff', width: 1.5 } },
+                    hoverinfo: 'text',
+                    hovertemplate: '%{text}<extra></extra>'
+                };
+
+                const layout = {
+                    title: { text: 'Distribución de Variación (Rangos Totales Propuestos de Tolerancia)', font: { size: 14, family: 'Inter', color: '#1e293b' } },
+                    margin: { t: 40, l: 50, r: 20, b: 60 },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                    showlegend: false,
+                    barmode: 'overlay',
+                    xaxis: { title: 'Rango Total de Tolerancia Propuesta', tickangle: -15, gridcolor: '#f1f5f9', titlefont: {size: 12} },
+                    yaxis: { title: 'Número de Dimensiones', gridcolor: '#e2e8f0', zerolinecolor: '#cbd5e1' }
+                };
+
+                Plotly.newPlot(plotDivHist.current, [traceBar, traceScatter], layout, {responsive: true, displayModeBar: false});
+            }, [data]);
+
+            if(data.length === 0) return null;
+            const moldsList = data[0].moldesData.map(m => m.name);
+
+            return (
+                <div className="space-y-6 mt-6">
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                        <div ref={plotDivHist} className="w-full h-[380px]"></div>
+                        <p className="text-center text-xs text-slate-500 mt-2">Pasa el cursor sobre los puntos para consultar qué dimensión se encuentra en cada rango de tolerancia propuesto.</p>
+                    </div>
+
+                    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                        <div className="p-4 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+                            <h2 className="font-bold text-slate-700">Matriz de Homogeneidad y Capacidad</h2>
+                            <div className="flex gap-4 text-xs font-semibold">
+                                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-emerald-400"></span> Varianza Homogenea</span>
+                                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-rose-400"></span> Varianza No homogenea</span>
+                            </div>
+                        </div>
+                        <div className="overflow-x-auto custom-scrollbar" style={{maxHeight: '2500px'}}>
+                            <table className="w-full text-sm text-left">
+                                <thead className="text-xs text-slate-500 bg-white sticky top-0 shadow-sm z-10">
+                                    <tr>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200">Dimensión</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Categoría</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Ppk Global</th>
+                                        {moldsList.map(m => (
+                                            <th key={m} className="px-4 py-3 font-bold border-b border-slate-200 text-center">{m}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {data.map((row, idx) => (
+                                        <tr key={idx} className="border-b border-slate-100 hover:bg-slate-50 transition-colors">
+                                            <td className="px-4 py-3 font-medium text-slate-800">{row.dimension}</td>
+                                            <td className="px-4 py-3 text-center">
+                                                <span className="px-2 py-1 bg-slate-100 text-slate-600 rounded-lg text-[10px] font-bold uppercase whitespace-nowrap">{row.categoria}</span>
+                                            </td>
+                                            <td className="px-4 py-3 text-center">
+                                                <span className={`font-bold ${row.globalPpk >= row.targetPpk ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                    {row.globalPpk.toFixed(3)}
+                                                </span>
+                                            </td>
+                                            {row.moldesData.map((m, mIdx) => (
+                                                <td key={mIdx} className="px-4 py-3 text-center">
+                                                    <div className="flex flex-col items-center justify-center gap-1">
+                                                        <div className={`w-3.5 h-3.5 rounded-full shadow-sm ${m.isStable ? 'bg-emerald-400' : 'bg-rose-400'}`} title={`p-value: ${m.pValue.toFixed(4)}`}></div>
+                                                        <span className="text-[10px] text-slate-400 font-medium">{m.ppk.toFixed(3)}</span>
+                                                    </div>
+                                                </td>
+                                            ))}
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const EstrategiaView = ({ data, activeTargetPpk }) => {
+            const plotDiv1 = useRef(null);
+            const plotDiv2 = useRef(null);
+
+            useEffect(() => {
+                if(!data || data.length === 0 || !plotDiv1.current || !plotDiv2.current) return;
+
+                const moldsObj = {};
+                data[0].moldesData.forEach(m => {
+                    moldsObj[m.name] = { ppkSum: 0, stableCount: 0, total: 0 };
+                });
+
+                data.forEach(d => {
+                    d.moldesData.forEach(m => {
+                        if(moldsObj[m.name]) {
+                            moldsObj[m.name].ppkSum += m.ppk;
+                            if(m.isStable) moldsObj[m.name].stableCount++;
+                            moldsObj[m.name].total++;
+                        }
+                    });
+                });
+
+                const moldNames = Object.keys(moldsObj);
+                const moldPpks = moldNames.map(m => moldsObj[m].ppkSum / moldsObj[m].total);
+                const moldStablePct = moldNames.map(m => (moldsObj[m].stableCount / moldsObj[m].total) * 100);
+
+                const trace1 = {
+                    x: moldNames, y: moldPpks,
+                    type: 'bar', name: 'Ppk Promedio',
+                    marker: { color: '#008080', opacity: 0.8, line: { color: '#006666', width: 1 } },
+                    yaxis: 'y1'
+                };
+                
+                const trace2 = {
+                    x: moldNames, y: moldStablePct,
+                    type: 'scatter', mode: 'lines+markers', name: '% Estabilidad',
+                    marker: { color: '#10b981', size: 10, line: { color: '#ffffff', width: 2 } },
+                    line: { color: '#10b981', width: 3, shape: 'spline' },
+                    yaxis: 'y2'
+                };
+
+                const layout1 = {
+                    title: { text: 'Rendimiento Promedio por Molde', font: { size: 14, family: 'Inter', color: '#1e293b' } },
+                    margin: { t: 40, l: 50, r: 50, b: 60 },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                    legend: { orientation: 'h', x: 0.5, y: -0.2, xanchor: 'center' },
+                    xaxis: { title: '', tickangle: -45, gridcolor: '#f1f5f9' },
+                    yaxis: { title: 'Ppk Promedio', gridcolor: '#e2e8f0', zerolinecolor: '#cbd5e1' },
+                    yaxis2: { 
+                        title: '% Estabilidad Varianza', overlaying: 'y', side: 'right', 
+                        range: [0, 110], gridcolor: 'rgba(0,0,0,0)',
+                        tickfont: { color: '#10b981' }, titlefont: { color: '#10b981' }
+                    }
+                };
+
+                Plotly.newPlot(plotDiv1.current, [trace1, trace2], layout1, {responsive: true, displayModeBar: false});
+
+                const subgroups = data[0].moldesData.map(m => m.name);
+                const COLORS = ['#008080','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899','#84cc16', '#64748b'];
+                
+                let allX = [];
+                let allY = [];
+
+                const tracesScatter = subgroups.map((sg, i) => {
+                    const scatterX = [];
+                    const scatterY = [];
+                    const texts = [];
+
+                    data.forEach(d => {
+                        const mData = d.moldesData.find(m => m.name === sg);
+                        if (mData) {
+                            scatterX.push(mData.idr);
+                            scatterY.push(mData.ppk);
+                            allX.push(mData.idr);
+                            allY.push(mData.ppk);
+                            
+                            const hoverText = '<b>' + d.dimension + '</b><br>' +
+                                              'Molde: ' + mData.name + '<br>' +
+                                              'Categoría: ' + d.categoria + '<br>' +
+                                              'IDR: ' + mData.idr.toFixed(2) + '%<br>' +
+                                              'Ppk: ' + mData.ppk.toFixed(3);
+                            texts.push(hoverText);
+                        }
+                    });
+
+                    return {
+                        x: scatterX, y: scatterY, text: texts,
+                        mode: 'markers', type: 'scatter', name: sg,
+                        marker: { size: 10, color: COLORS[i % COLORS.length], opacity: 0.85, line: {width: 1, color: '#ffffff'} },
+                        hoverinfo: 'text',
+                        hovertemplate: '%{text}<extra></extra>'
+                    };
+                });
+
+                const maxX = 300;
+                const minPpkY = -3;
+                const maxPpkY = 3;
+                
+                const targetIDR = 50;
+
+                const layout2 = {
+                    title: { text: `Mapa Estratégico de Moldes (Meta Dinámica: ${activeTargetPpk})`, font: { size: 14, family: 'Inter', color: '#1e293b' } },
+                    margin: { t: 40, l: 50, r: 120, b: 50 },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                    xaxis: { title: 'IDR: Desplazamiento Relativo (% de Tolerancia)', range: [0, maxX], gridcolor: '#f1f5f9', zerolinecolor: '#cbd5e1' },
+                    yaxis: { title: 'Ppk Operativo Individual', range: [minPpkY, maxPpkY], gridcolor: '#f1f5f9', zerolinecolor: '#cbd5e1' },
+                    showlegend: true,
+                    legend: { orientation: 'v', x: 1.02, y: 1, bordercolor: '#e2e8f0', borderwidth: 1, borderpad: 5, font: { size: 11, family: 'Inter' }, bgcolor: 'rgba(255,255,255,0.8)' },
+                    shapes: [
+                        { type: 'rect', xref: 'x', yref: 'y', x0: 0, x1: targetIDR, y0: activeTargetPpk, y1: maxPpkY, fillcolor: 'rgba(16, 185, 129, 0.1)', line: { width: 0 }, layer: 'below' },
+                        { type: 'rect', xref: 'x', yref: 'y', x0: 0, x1: targetIDR, y0: minPpkY, y1: activeTargetPpk, fillcolor: 'rgba(234, 179, 8, 0.1)', line: { width: 0 }, layer: 'below' },
+                        { type: 'rect', xref: 'x', yref: 'y', x0: targetIDR, x1: maxX, y0: minPpkY, y1: activeTargetPpk, fillcolor: 'rgba(239, 68, 68, 0.1)', line: { width: 0 }, layer: 'below' },
+                        { type: 'rect', xref: 'x', yref: 'y', x0: targetIDR, x1: maxX, y0: activeTargetPpk, y1: maxPpkY, fillcolor: 'rgba(249, 115, 22, 0.1)', line: { width: 0 }, layer: 'below' },
+                        { type: 'line', xref: 'x', yref: 'y', x0: 0, x1: maxX, y0: activeTargetPpk, y1: activeTargetPpk, line: { color: '#334155', width: 1.5, dash: 'dash' } },
+                        { type: 'line', xref: 'x', yref: 'y', x0: targetIDR, x1: targetIDR, y0: minPpkY, y1: maxPpkY, line: { color: '#334155', width: 1.5, dash: 'dash' } }
+                    ],
+                    annotations: [
+                        { x: 25, y: maxPpkY, xref: 'x', yref: 'y', text: '<b>CAPACIDAD IDEAL</b>', showarrow: false, font: { color: '#059669', size: 10 }, xanchor: 'center', yanchor: 'top', yshift: -10 },
+                        { x: 25, y: minPpkY, xref: 'x', yref: 'y', text: '<b>ALTA VARIANZA</b>', showarrow: false, font: { color: '#ca8a04', size: 10 }, xanchor: 'center', yanchor: 'bottom', yshift: 10 },
+                        { x: targetIDR + (maxX - targetIDR)/2, y: minPpkY, xref: 'x', yref: 'y', text: '<b>ESTADO CRÍTICO</b>', showarrow: false, font: { color: '#dc2626', size: 10 }, xanchor: 'center', yanchor: 'bottom', yshift: 10 },
+                        { x: targetIDR + (maxX - targetIDR)/2, y: maxPpkY, xref: 'x', yref: 'y', text: '<b>PROCESO CAPAZ, REQUIERE CENTRAR</b>', showarrow: false, font: { color: '#ea580c', size: 10 }, xanchor: 'center', yanchor: 'top', yshift: -10 }
+                    ]
+                };
+
+                Plotly.newPlot(plotDiv2.current, tracesScatter, layout2, {responsive: true, displayModeBar: false});
+            }, [data, activeTargetPpk]);
+
+            // --- FUNCIÓN PARA EXPORTAR LA TABLA A EXCEL/CSV ---
+            const exportToExcel = () => {
+                const exportData = data.map(row => {
+                    const tolActual = row.isGDTUnilateral 
+                        ? `+${(row.usl - row.espec).toFixed(3)} / -0.000` 
+                        : `+/- ${(row.actRango / 2).toFixed(3)}`;
+                    const tolPropuesta = row.isGDTUnilateral
+                        ? `+${(row.propUsl - row.espec).toFixed(3)} / -0.000`
+                        : `+/- ${(row.propRango / 2).toFixed(3)}`;
+                    
+                    let deltaTolPct = 0;
+                    if (row.actRango > 0) {
+                        deltaTolPct = ((row.propRango - row.actRango) / row.actRango) * 100;
+                    }
+                    const deltaTolStr = (deltaTolPct > 0 ? '+' : '') + deltaTolPct.toFixed(1) + '%';
+
+                    const desvNominal = row.globalStats.mean - row.espec;
+                    const desvNominalStr = (desvNominal > 0 ? '+' : '') + desvNominal.toFixed(4);
+
+                    const stdGlobal = row.globalStats.std;
+                    const ppProyectado = (row.propRango > 0 && stdGlobal > 0) ? (row.propRango / (6 * stdGlobal)) : 0;
+                    const ppkProyectado = (stdGlobal > 0) 
+                        ? (row.isUnilateral 
+                            ? (row.propUsl - row.globalStats.mean) / (3 * stdGlobal) 
+                            : Math.min(row.propUsl - row.globalStats.mean, row.globalStats.mean - row.propLsl) / (3 * stdGlobal))
+                        : 0;
+                        
+                    let finalStrategy = row.redefStrategy;
+                    if (finalStrategy === 'Redefinir Tolerancia' && (ppProyectado - ppkProyectado) > 0.3) {
+                        finalStrategy = 'REDEFINIR TOLERANCIA, CENTRAR';
+                    }
+
+                    return {
+                        'Dimensión': row.dimension,
+                        'Tolerancias Actuales': tolActual,
+                        'Ppk Actual': row.globalPpk.toFixed(3),
+                        'Desv. vs Nominal': desvNominalStr,
+                        'Desv. Std Global': stdGlobal.toFixed(4),
+                        'Tolerancias Propuestas': tolPropuesta,
+                        'Delta Tolerancia': deltaTolStr,
+                        'PP Proyectado': ppProyectado.toFixed(3),
+                        'PPk Proyectado': ppkProyectado.toFixed(3),
+                        'Estrategia': finalStrategy
+                    };
+                });
+
+                const csv = Papa.unparse(exportData);
+                const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                
+                const link = document.createElement('a');
+                link.setAttribute('href', url);
+                link.setAttribute('download', 'Matriz_de_Especificaciones.csv');
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            const totalDims = data.length;
+            const capaces = data.filter(d => d.globalPpk >= d.targetPpk).length;
+            const pctCapaz = ((capaces / totalDims) * 100) || 0;
+            let totalMolds = 0, stableMolds = 0;
+            
+            data.forEach(d => d.moldesData.forEach(m => {
+                totalMolds++;
+                if(m.isStable) stableMolds++;
+            }));
+            const pctEstable = ((stableMolds / totalMolds) * 100) || 0;
+            const opps = data.filter(d => d.redefStrategy === 'Redefinir Tolerancia' || d.redefStrategy === 'REDEFINIR TOLERANCIA, CENTRAR').length;
+
+            return (
+                <div className="space-y-6 mt-6">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <CardKPI title="CTQs Analizados" value={totalDims} colorClass="text-slate-800" />
+                        <CardKPI title="% Capaces Global" value={`${pctCapaz.toFixed(1)}%`} colorClass={pctCapaz > 80 ? "text-emerald-600" : "text-amber-500"} />
+                        <CardKPI title="% Estabilidad Total" value={`${pctEstable.toFixed(1)}%`} colorClass={pctEstable > 90 ? "text-teal-600" : "text-amber-500"} />
+                        <CardKPI title="Oportunidades Specs" value={opps} sub="Requieren ampliación/centrado" colorClass="text-purple-600" />
+                    </div>
+
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                            <div ref={plotDiv1} className="w-full h-[450px]"></div>
+                        </div>
+                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                            <div ref={plotDiv2} className="w-full h-[450px]"></div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden mt-8">
+                        <div className="p-4 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+                            <div>
+                                <h2 className="font-bold text-slate-700">Matriz de Redefinición de Especificaciones</h2>
+                                <p className="text-xs text-slate-500 mt-1 font-medium">Nota: La proyeccion de PP, considera la variación actual de todos los moldes estables / NO estables.</p>
+                            </div>
+                            
+                            <button 
+                                onClick={exportToExcel}
+                                className="flex items-center gap-2 px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm"
+                            >
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                                </svg>
+                                Descargar Excel (CSV)
+                            </button>
+                        </div>
+                        <div className="overflow-x-auto custom-scrollbar" style={{maxHeight: '500px'}}>
+                            <table className="w-full text-sm text-left">
+                                <thead className="text-xs text-slate-500 bg-white sticky top-0 shadow-sm z-10">
+                                    <tr>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200">Dimensión</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Tolerancias Actuales</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Ppk Actual</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center" title="Diferencia de la Media Global respecto a la Nominal">Desv. vs Nominal</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center" title="Desviación Estándar de todos los moldes">Desv. Std Global</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Tolerancias Propuestas</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Delta Tolerancia</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center bg-purple-50" title="PP Proyectado (Media Centrada) = (USL Prop. - LSL Prop.) / (6 * Desv Std Global)">PP Proyectado</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center bg-indigo-50" title="PPk Proyectado usando Desv Std Global">PPk Proyectado</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Estrategia</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {data.map((row, idx) => {
+                                        const tolActual = row.isGDTUnilateral 
+                                            ? `+${(row.usl - row.espec).toFixed(3)} / -0.000` 
+                                            : `+/- ${(row.actRango / 2).toFixed(3)}`;
+                                        const tolPropuesta = row.isGDTUnilateral
+                                            ? `+${(row.propUsl - row.espec).toFixed(3)} / -0.000`
+                                            : `+/- ${(row.propRango / 2).toFixed(3)}`;
+                                        
+                                        let deltaTolPct = 0;
+                                        if (row.actRango > 0) {
+                                            deltaTolPct = ((row.propRango - row.actRango) / row.actRango) * 100;
+                                        }
+                                        const deltaTolStr = (deltaTolPct > 0 ? '+' : '') + deltaTolPct.toFixed(1) + '%';
+
+                                        const desvNominal = row.globalStats.mean - row.espec;
+                                        const desvNominalStr = (desvNominal > 0 ? '+' : '') + desvNominal.toFixed(4);
+
+                                        const stdGlobal = row.globalStats.std;
+                                        const ppProyectado = (row.propRango > 0 && stdGlobal > 0) 
+                                            ? (row.propRango / (6 * stdGlobal)) 
+                                            : 0;
+                                        const ppkProyectado = (stdGlobal > 0)
+                                            ? (row.isUnilateral 
+                                                ? (row.propUsl - row.globalStats.mean) / (3 * stdGlobal) 
+                                                : Math.min(row.propUsl - row.globalStats.mean, row.globalStats.mean - row.propLsl) / (3 * stdGlobal))
+                                            : 0;
+                                            
+                                        let finalStrategy = row.redefStrategy;
+                                        if (finalStrategy === 'Redefinir Tolerancia' && (ppProyectado - ppkProyectado) > 0.3) {
+                                            finalStrategy = 'REDEFINIR TOLERANCIA, CENTRAR';
+                                        }
+
+                                        return (
+                                            <tr key={idx} className="border-b border-slate-100 hover:bg-slate-50 transition-colors">
+                                                <td className="px-4 py-3 font-medium text-slate-800">{row.dimension}</td>
+                                                <td className="px-4 py-3 text-center text-slate-600 font-mono text-xs">{tolActual}</td>
+                                                <td className="px-4 py-3 text-center font-bold text-slate-700">{row.globalPpk.toFixed(3)}</td>
+                                                <td className="px-4 py-3 text-center font-semibold text-slate-700">{desvNominalStr}</td>
+                                                <td className="px-4 py-3 text-center text-slate-600">{stdGlobal.toFixed(4)}</td>
+                                                <td className="px-4 py-3 text-center text-teal-600 font-mono text-xs font-semibold">{tolPropuesta}</td>
+                                                <td className={`px-4 py-3 text-center font-bold text-xs ${deltaTolPct > 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                                                    {deltaTolStr}
+                                                </td>
+                                                <td className="px-4 py-3 text-center font-black text-purple-600 bg-purple-50/30">{ppProyectado.toFixed(3)}</td>
+                                                <td className="px-4 py-3 text-center font-black text-indigo-600 bg-indigo-50/30">{ppkProyectado.toFixed(3)}</td>
+                                                <td className="px-4 py-3 text-center">
+                                                    <span className={`px-2 py-1 rounded-lg text-[10px] font-bold uppercase whitespace-nowrap ${
+                                                        finalStrategy === 'Mantener' ? 'bg-slate-100 text-slate-600' :
+                                                        finalStrategy === 'Centrar Proceso' ? 'bg-teal-100 text-teal-700' :
+                                                        finalStrategy === 'Consolidar' ? 'bg-emerald-100 text-emerald-700' :
+                                                        finalStrategy === 'REDEFINIR TOLERANCIA, CENTRAR' ? 'bg-orange-100 text-orange-700' :
+                                                        'bg-rose-100 text-rose-600'
+                                                    }`}>
+                                                        {finalStrategy}
+                                                    </span>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const DetalleView = ({ data }) => {
+            const [selectedId, setSelectedId] = useState(data[0]?.id || 0);
+            const plotDiv = useRef(null);
+
+            useEffect(() => {
+                if(!data.find(d => d.id === selectedId)) {
+                    setSelectedId(data[0]?.id || 0);
+                }
+            }, [data]);
+
+            const item = data.find(d => d.id === selectedId) || data[0];
+
+            useEffect(() => {
+                if(!item || !plotDiv.current) return;
+                const traces = [];
+                item.moldesData.forEach(m => {
+                    traces.push({
+                        y: m.values, type: 'box', name: m.name, boxpoints: 'all', jitter: 0.5, pointpos: 0,
+                        marker: { color: m.isStable ? '#008080' : '#f43f5e', size: 4, opacity: 0.6 },
+                        line: { color: m.isStable ? '#004d4d' : '#be123c', width: 1 }
+                    });
+                });
+
+                const layout = {
+                    title: { text: `Distribución de Mediciones: ${item.dimension}`, font: { size: 14, family: 'Inter' } },
+                    margin: { t: 40, l: 40, r: 40, b: 40 },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                    showlegend: false,
+                    yaxis: { title: 'Dimensión', gridcolor: '#f1f5f9', zerolinecolor: '#cbd5e1' },
+                    shapes: [
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.usl, y1: item.usl, line: { color: '#ef4444', width: 2, dash: 'dash' } },
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.lsl, y1: item.lsl, line: { color: '#ef4444', width: 2, dash: 'dash' } },
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.propUsl, y1: item.propUsl, line: { color: '#008080', width: 2, dash: 'dot' } },
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.propLsl, y1: item.propLsl, line: { color: '#008080', width: 2, dash: 'dot' } },
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.espec, y1: item.espec, line: { color: '#000000', width: 1, dash: 'dot' } }
+                    ]
+                };
+
+                Plotly.newPlot(plotDiv.current, traces, layout, {responsive: true, displayModeBar: false});
+            }, [item]);
+
+            if(!item) return null;
+
+            const globalDesvNominal = item.globalStats.mean - item.espec;
+
+            return (
+                <div className="space-y-6 mt-6">
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 flex flex-col md:flex-row gap-4 items-center">
+                        <label className="text-sm font-bold text-slate-700 whitespace-nowrap">Seleccionar Dimensión:</label>
+                        <select 
+                            className="w-full bg-slate-50 border border-slate-200 text-sm rounded-lg px-4 py-2 focus:ring-2 focus:ring-teal-500 outline-none transition-all"
+                            value={selectedId} onChange={(e) => setSelectedId(parseInt(e.target.value))}
+                        >
+                            {data.map(d => (
+                                <option key={d.id} value={d.id}>{d.dimension}</option>
+                            ))}
+                        </select>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                            <h3 className="text-sm font-bold text-slate-700 mb-3 border-b border-slate-100 pb-2">Métricas Globales</h3>
+                            <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">PPk Global</p>
+                                    <p className={`text-lg font-black ${item.globalPpk >= item.targetPpk ? 'text-emerald-600' : 'text-rose-600'}`}>{item.globalPpk.toFixed(3)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Promedio Real</p>
+                                    <p className="text-lg font-bold text-slate-700">{item.globalStats.mean.toFixed(4)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Desv. vs Nominal</p>
+                                    <p className="text-lg font-bold text-slate-700">{globalDesvNominal > 0 ? '+' : ''}{globalDesvNominal.toFixed(4)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Desviación (Sigma)</p>
+                                    <p className="text-lg font-bold text-slate-700">{item.globalStats.std.toFixed(4)}</p>
+                                </div>
+                                <div className="bg-teal-50/50 p-2.5 rounded-xl border border-teal-100">
+                                    <p className="text-[10px] text-teal-700 font-bold uppercase tracking-wide">Desv. Pooled</p>
+                                    <p className="text-lg font-black text-teal-800">{item.pooledSigma.toFixed(4)}</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                            <h3 className="text-sm font-bold text-slate-700 mb-3 border-b border-slate-100 pb-2">Specs & Tolerancias</h3>
+                            <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Nominal</p>
+                                    <p className="text-xl font-black text-slate-800">{item.espec.toFixed(3)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Tol. Actuales</p>
+                                    <p className="text-base lg:text-lg font-bold text-slate-600">
+                                        {item.isGDTUnilateral ? `+${(item.usl - item.espec).toFixed(3)} / -0.000` : `+/- ${(item.actRango / 2).toFixed(3)}`}
+                                    </p>
+                                </div>
+                                <div className="bg-purple-50 p-2.5 rounded-xl border border-purple-100 shadow-sm">
+                                    <p className="text-[10px] text-purple-600 font-bold uppercase tracking-wide">Tol. Propuestas</p>
+                                    <p className="text-base lg:text-lg font-black text-purple-700">
+                                        {item.isGDTUnilateral ? `+${(item.propUsl - item.espec).toFixed(3)} / -0.000` : `+/- ${(item.propRango / 2).toFixed(3)}`}
+                                    </p>
+                                </div>
+                            </div>
+                            <div className="mt-3 flex items-center gap-4 text-xs font-medium text-slate-500">
+                                <span className="flex items-center gap-1"><span className="w-4 h-0.5 bg-rose-500 block"></span> Límites Actuales</span>
+                                <span className="flex items-center gap-1"><span className="w-4 h-0.5 bg-teal-600 block border-b border-dotted border-teal-600"></span> Límites Propuestos</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                        <div ref={plotDiv} className="w-full h-[500px]"></div>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                        {item.moldesData.map((m, idx) => {
+                            const desviacion = m.stats.mean - item.espec;
+                            
+                            const cardStyle = m.isStable 
+                                ? 'bg-emerald-50 border-emerald-200 text-emerald-900' 
+                                : 'bg-rose-50 border-rose-200 text-rose-900';
+                            
+                            const badgeStyle = m.isStable
+                                ? 'bg-emerald-200/60 text-emerald-800'
+                                : 'bg-rose-200/60 text-rose-800';
+
+                            const itemBgStyle = m.isStable
+                                ? 'bg-emerald-100/50'
+                                : 'bg-rose-100/50';
+
+                            return (
+                                <div key={idx} className={`p-4 rounded-xl shadow-sm border hover:shadow-md transition-shadow ${cardStyle}`}>
+                                    <div className="flex justify-between items-center mb-3 border-b border-black/5 pb-2">
+                                        <h4 className="font-bold text-sm truncate" title={m.name}>{m.name}</h4>
+                                        <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold ${badgeStyle}`}>
+                                            <div className={`w-1.5 h-1.5 rounded-full ${m.isStable ? 'bg-emerald-500' : 'bg-rose-500'}`}></div>
+                                            {m.isStable ? 'Homogéneo' : 'No Homogéneo'}
+                                        </div>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <div className={`flex justify-between items-center p-2 rounded-lg ${itemBgStyle}`}>
+                                            <span className="text-[11px] font-bold uppercase tracking-wider opacity-70">PPk</span>
+                                            <span className="text-sm font-black">{m.ppk.toFixed(3)}</span>
+                                        </div>
+                                        <div className={`flex justify-between items-center p-2 rounded-lg ${itemBgStyle}`}>
+                                            <span className="text-[11px] font-bold uppercase tracking-wider opacity-70" title="Media - Valor Nominal">Desv. vs Nominal</span>
+                                            <span className="text-sm font-bold">
+                                                {desviacion > 0 ? '+' : ''}{desviacion.toFixed(4)}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [rawCsvArray, setRawCsvArray] = useState(null);
+            const [activeTab, setActiveTab] = useState('resumen');
+            const [filterCat, setFilterCat] = useState('Todas');
+            const [excludedMolds, setExcludedMolds] = useState([]);
+            const [fileName, setFileName] = useState('');
+
+            // --- MANEJADOR DE CARGA DE ARCHIVO ---
+            const handleFileUpload = (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    setFileName(file.name);
+                    Papa.parse(file, {
+                        complete: (results) => {
+                            setRawCsvArray(results.data);
+                            setExcludedMolds([]); // Resetear exclusiones al cargar nuevo archivo
+                            setFilterCat('Todas'); // Resetear filtro
+                            setActiveTab('resumen'); // Resetear vista
+                        },
+                        skipEmptyLines: true,
+                        encoding: "UTF-8" // Mejor soporte para acentos en español
+                    });
+                }
+                // Resetear el input para poder cargar el mismo archivo nuevamente si es necesario
+                e.target.value = null; 
+            };
+
+            // Re-procesar todos los datos cuando cambia el archivo O cuando excluimos un molde
+            const { rawData, partInfo, allAvailableMolds } = useMemo(() => {
+                if (!rawCsvArray || rawCsvArray.length === 0) return { rawData: null, partInfo: '', allAvailableMolds: [] };
+                try {
+                    return processData(rawCsvArray, excludedMolds);
+                } catch (e) {
+                    console.error("Error procesando CSV:", e);
+                    return { rawData: null, partInfo: '', allAvailableMolds: [] };
+                }
+            }, [rawCsvArray, excludedMolds]);
+
+            const toggleMold = (mold) => {
+                if (!excludedMolds.includes(mold)) {
+                    if (allAvailableMolds.length - excludedMolds.length <= 1) {
+                        alert("El análisis requiere mantener al menos una cavidad activa.");
+                        return;
+                    }
+                    setExcludedMolds(prev => [...prev, mold]);
+                } else {
+                    setExcludedMolds(prev => prev.filter(m => m !== mold));
+                }
+            };
+
+            // VISTA INICIAL SIN DATOS CARGADOS
+            if (!rawData) {
+                return (
+                    <div className="min-h-screen flex flex-col items-center justify-center bg-[#008080] text-white font-medium space-y-6">
+                        <div className="text-3xl font-black tracking-tight">Tablero de Capacidad y Estrategia</div>
+                        <p className="text-teal-100 text-sm max-w-lg text-center">
+                            Sube tu archivo CSV manteniendo la estructura de columnas requerida (Dimensión, Categoría, Espec, Tol. Sup, Tol. Inf, y las lecturas por Molde).
+                        </p>
+                        <label className="cursor-pointer bg-white text-[#008080] px-6 py-3 rounded-xl font-bold shadow-lg hover:bg-teal-50 hover:shadow-xl transition-all flex items-center gap-3">
+                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                            Subir Archivo CSV
+                            <input type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
+                        </label>
+                    </div>
+                );
+            }
+
+            const activeTargetPpk = getTargetPpk(filterCat);
+            const filteredData = filterCat === 'Todas' ? rawData : rawData.filter(d => (d.categoria || "").toLowerCase() === filterCat.toLowerCase());
+            
+            const extractedCategories = rawData.map(d => d.categoria || 'CP');
+            const categorias = Array.from(new Set(['Todas', 'CP', 'CTQ', 'DVA Apariencia', ...extractedCategories]));
+
+            return (
+                <div className="max-w-[1400px] mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
+                    <div className="glass-panel p-6 rounded-2xl shadow-sm flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6">
+                        <div>
+                            <h1 className="text-2xl font-black text-slate-800 tracking-tight">Capacidad Homogénea de Proceso</h1>
+                            <p className="text-sm font-medium text-slate-500 mt-1">
+                                {partInfo ? partInfo : 'Análisis Multicavidad / Multimolde'}
+                            </p>
+                        </div>
+                        
+                        <div className="flex flex-col sm:flex-row gap-4 w-full lg:w-auto items-center">
+                            <div className="flex flex-wrap items-center gap-2 bg-slate-50 border border-slate-200 p-1.5 rounded-lg">
+                                {categorias.map(cat => (
+                                    <button 
+                                        key={cat}
+                                        onClick={() => setFilterCat(cat)}
+                                        className={`px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${
+                                            filterCat === cat 
+                                            ? 'bg-[#008080] text-white shadow-sm border border-[#006666]' 
+                                            : 'text-slate-500 hover:text-slate-700'
+                                        }`}
+                                    >
+                                        {cat}
+                                    </button>
+                                ))}
+                            </div>
+                            
+                            {/* Botón para cambiar archivo CSV directamente desde la barra superior */}
+                            <label className="cursor-pointer flex items-center gap-2 px-4 py-2 bg-white border-2 border-slate-200 text-slate-600 hover:text-teal-600 hover:border-teal-400 hover:bg-teal-50 rounded-lg text-xs font-bold transition-all shadow-sm whitespace-nowrap">
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                                {fileName ? "Cambiar CSV" : "Subir CSV"}
+                                <input type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
+                            </label>
+                        </div>
+                    </div>
+
+                    <div className="flex items-center justify-between px-2">
+                        <div className="flex items-center gap-2">
+                            <span className="relative flex h-3 w-3">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-teal-300 opacity-75"></span>
+                                <span className="relative inline-flex rounded-full h-3 w-3 bg-teal-100"></span>
+                            </span>
+                            <span className="text-xs font-bold text-teal-50">
+                                Meta actual (Ppk): <span className="text-white">{activeTargetPpk}</span> {filterCat !== 'Todas' && `(Categoría: ${filterCat})`}
+                            </span>
+                        </div>
+                        {fileName && (
+                            <div className="text-xs font-medium text-teal-200">
+                                Archivo cargado: <span className="font-bold text-white">{fileName}</span>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Nuevo Control: Toggles para incluir o excluir cavidades */}
+                    {allAvailableMolds && allAvailableMolds.length > 0 && (
+                        <div className="bg-teal-900/20 p-4 rounded-xl border border-teal-700/30 mb-2 mt-4 mx-2">
+                            <div className="flex items-center justify-between mb-3">
+                                <span className="text-sm font-bold text-teal-50">Seleccionar Cavidades/Moldes para el Análisis:</span>
+                                <span className="text-xs font-semibold bg-teal-800 text-teal-100 px-2 py-1 rounded-md shadow-sm border border-teal-700">
+                                    Activas: {allAvailableMolds.length - excludedMolds.length} / {allAvailableMolds.length}
+                                </span>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                                {allAvailableMolds.map(mold => {
+                                    const isExcluded = excludedMolds.includes(mold);
+                                    return (
+                                        <button 
+                                            key={mold}
+                                            onClick={() => toggleMold(mold)}
+                                            className={`flex items-center gap-2 px-3 py-1.5 text-xs font-bold rounded-lg transition-all border ${
+                                                !isExcluded 
+                                                ? 'bg-teal-500 hover:bg-teal-400 text-white border-teal-400 shadow-sm' 
+                                                : 'bg-teal-900/40 hover:bg-teal-800 text-teal-300/50 border-teal-800/50'
+                                            }`}
+                                        >
+                                            <div className={`flex items-center justify-center w-4 h-4 rounded-full border ${!isExcluded ? 'bg-white border-white text-teal-600' : 'border-teal-600 text-transparent'}`}>
+                                                {!isExcluded && <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>}
+                                            </div>
+                                            {mold}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="flex gap-4 px-2 mt-4">
+                        <button 
+                            onClick={() => setActiveTab('resumen')}
+                            className={`px-4 py-2 text-sm font-bold rounded-lg transition-colors shadow-sm ${activeTab === 'resumen' ? 'bg-white text-[#008080]' : 'bg-teal-700 text-teal-100 hover:bg-teal-600'}`}
+                        >
+                            Resumen Global
+                        </button>
+                        <button 
+                            onClick={() => setActiveTab('estrategia')}
+                            className={`px-4 py-2 text-sm font-bold rounded-lg transition-colors shadow-sm ${activeTab === 'estrategia' ? 'bg-white text-[#008080]' : 'bg-teal-700 text-teal-100 hover:bg-teal-600'}`}
+                        >
+                            Estrategia de Proceso
+                        </button>
+                        <button 
+                            onClick={() => setActiveTab('detalle')}
+                            className={`px-4 py-2 text-sm font-bold rounded-lg transition-colors shadow-sm ${activeTab === 'detalle' ? 'bg-white text-[#008080]' : 'bg-teal-700 text-teal-100 hover:bg-teal-600'}`}
+                        >
+                            Análisis Detallado
+                        </button>
+                    </div>
+
+                    <div className="animate-fade-in">
+                        {filteredData.length === 0 ? (
+                            <div className="text-center py-20 text-white/80 font-bold">No hay datos que coincidan con el filtro actual.</div>
+                        ) : (
+                            <>
+                                {activeTab === 'resumen' && <ResumenView data={filteredData} />}
+                                {activeTab === 'estrategia' && <EstrategiaView data={filteredData} activeTargetPpk={activeTargetPpk} />}
+                                {activeTab === 'detalle' && <DetalleView data={filteredData} />}
+                            </>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
